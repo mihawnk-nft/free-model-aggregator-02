@@ -10,13 +10,18 @@
 // Routing, in one place. Candidates are every free model meeting the request's
 // requirements, ranked by the brief's rating_milli (quality is 60% of the
 // score); ties go to the model with the fewest calls so far, which spreads the
-// load over the models' own rate limits instead of draining one. A refusal is
-// counted, the request moves on to the next-best model, and a model that
-// refuses three calls in a row is treated as spent for the trial. The trail of
-// refusals is reported on the response as x-makefun-upstream-failures, the only
-// way the failover column can see a refusal the entry retried and then served.
-// The catalog is exactly the fourteen free ids the brief names: register that
-// same set and answer GET /v1/models with it on both auth headers.
+// load over the models' own rate limits instead of draining one. A model that
+// has refused is set aside: it is tried only after every model that has not
+// refused, because a refusal means it is limited right now and dialling it
+// first on the next prompt wastes a gateway call (the score's tie-break counts
+// calls, and the trial's key has a daily ceiling) and usually refuses again.
+// A set-aside model is not dead — it is still tried when every clean candidate
+// refuses, and it becomes clean again the moment it answers. Three refusals
+// in a row spend a model for the trial. The trail of refusals is reported on
+// the response as x-makefun-upstream-failures, the only way the failover
+// column can see a refusal the entry retried and then served. The catalog is
+// exactly the fourteen free ids the brief names: register that same set and
+// answer GET /v1/models with it on both auth headers.
 //
 // The server is deterministic: every route is a function of the requests and
 // the gateway's answers seen so far, never of the wall clock, so a live pass
@@ -103,21 +108,45 @@ interface UpstreamFailure {
 }
 
 /**
- * The free models that can serve a request, best first: the brief's rating,
- * then the model with the fewest calls so far (load spreading), then the
- * brief's order (Array.sort is stable, so equal keys keep it). Spent models
- * are left out.
+ * Book one refusal against a model: its run of refusals grows, three in a row
+ * spends it, and the refusal goes on the trail the served response reports.
+ * Used for a gateway refusal and for a fetch that never reached the gateway.
+ */
+function recordRefusal(model: ModelRow, failures: UpstreamFailure[], status: number, code: string): void {
+  const state = stateOf(model.id);
+  state.consecutiveFailures += 1;
+  if (state.consecutiveFailures >= DEAD_AFTER_FAILURES) state.dead = true;
+  failures.push({ status, code, model: model.id });
+}
+
+/**
+ * The free models that can serve a request, best first.
+ *
+ * Order: models that have not refused come before models that have (a refusal
+ * means the model is limited right now, so trying it first on the next prompt
+ * spends a gateway call on an answer it will probably refuse again); inside
+ * each group the brief's rating, then the model with the fewest calls so far
+ * (load spreading), then the brief's order (Array.sort is stable, so equal
+ * keys keep it). Spent models are left out. A set-aside model is still tried
+ * when every clean candidate refuses, and answering clears its run of
+ * refusals, so it is clean again for the next prompt.
  */
 function candidatesFor(requires: Requirement): ModelRow[] {
-  return freeModels(brief)
+  // Read each model's state once: the sort below must see one snapshot, and
+  // a comparator that re-reads the map on every comparison hides that.
+  const ranked = freeModels(brief)
     .filter((model) => meetsRequirements(requires, capabilitiesOf(model)) && !stateOf(model.id).dead)
-    .sort((a, b) => {
-      if (b.rating_milli !== a.rating_milli) return b.rating_milli - a.rating_milli;
-      const callsA = stateOf(a.id).calls;
-      const callsB = stateOf(b.id).calls;
-      if (callsA !== callsB) return callsA - callsB;
-      return 0;
+    .map((model) => {
+      const state = stateOf(model.id);
+      return { model, setAside: state.consecutiveFailures > 0, rating: model.rating_milli, calls: state.calls };
     });
+  ranked.sort((a, b) => {
+    if (a.setAside !== b.setAside) return a.setAside ? 1 : -1;
+    if (b.rating !== a.rating) return b.rating - a.rating;
+    if (a.calls !== b.calls) return a.calls - b.calls;
+    return 0;
+  });
+  return ranked.map((entry) => entry.model);
 }
 
 /** The gateway's Chat Completions route. OPENAI_BASE_URL is the OpenAI-compatible root (`…/v1` on the trial network); a base that does not already end in `/v1` gets one, so both spellings reach the route. */
@@ -235,9 +264,10 @@ interface Served {
 
 /**
  * Dial the ranked candidates in order until one answers. A refusal counts
- * against the model (three in a row spends it) and goes on the trail; a fetch
- * that never reached the gateway counts the same way. Returns null when every
- * candidate refused: the prompt is lost.
+ * against the model (three in a row spends it, and one sets it aside for the
+ * next prompt's ranking) and goes on the trail; a fetch that never reached
+ * the gateway counts the same way. Returns null when every candidate
+ * refused: the prompt is lost.
  */
 async function serve(makeBody: (model: string) => Json, requires: Requirement): Promise<Served | null> {
   const failures: UpstreamFailure[] = [];
@@ -248,16 +278,12 @@ async function serve(makeBody: (model: string) => Json, requires: Requirement): 
     try {
       upstream = await dial(model.id, makeBody(model.id));
     } catch {
-      state.consecutiveFailures += 1;
-      if (state.consecutiveFailures >= DEAD_AFTER_FAILURES) state.dead = true;
-      failures.push({ status: 0, code: 'fetch_error', model: model.id });
+      recordRefusal(model, failures, 0, 'fetch_error');
       continue;
     }
     if (!upstream.ok || upstream.body === null) {
       const text = await upstream.text().catch(() => '');
-      state.consecutiveFailures += 1;
-      if (state.consecutiveFailures >= DEAD_AFTER_FAILURES) state.dead = true;
-      failures.push({ status: upstream.status, code: failureCode(upstream.status, text), model: model.id });
+      recordRefusal(model, failures, upstream.status, failureCode(upstream.status, text));
       continue;
     }
     state.consecutiveFailures = 0;
