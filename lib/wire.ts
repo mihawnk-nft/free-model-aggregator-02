@@ -244,6 +244,17 @@ function numberOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
+/** One OpenAI tool call as an Anthropic tool_use block: its id, name and parsed arguments; null when it is not a tool call. */
+function toolUseBlockOf(call: unknown): Json | null {
+  if (!isRecord(call) || !isRecord(call.function)) return null;
+  return {
+    type: 'tool_use',
+    id: typeof call.id === 'string' ? call.id : 'toolu_unknown',
+    name: typeof call.function.name === 'string' ? call.function.name : '',
+    input: argumentsOf(call.function.arguments),
+  };
+}
+
 /** A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled. */
 export function openAIToAnthropic(body: Json, model: string): Json {
   const choices = Array.isArray(body.choices) ? body.choices : [];
@@ -254,13 +265,8 @@ export function openAIToAnthropic(body: Json, model: string): Json {
   if (text !== '') content.push({ type: 'text', text });
   const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
   for (const call of calls) {
-    if (!isRecord(call) || !isRecord(call.function)) continue;
-    content.push({
-      type: 'tool_use',
-      id: typeof call.id === 'string' ? call.id : 'toolu_unknown',
-      name: typeof call.function.name === 'string' ? call.function.name : '',
-      input: argumentsOf(call.function.arguments),
-    });
+    const block = toolUseBlockOf(call);
+    if (block !== null) content.push(block);
   }
   if (content.length === 0) content.push({ type: 'text', text: '' });
   const usage = isRecord(body.usage) ? body.usage : {};
