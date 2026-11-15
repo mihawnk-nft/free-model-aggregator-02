@@ -292,50 +292,63 @@ async function serve(makeBody: (model: string) => Json, requires: Requirement): 
   return null;
 }
 
-/** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that meets it. */
-async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
+/** One wire's answer shape: its 502 error type, its stream relay and its JSON translator. */
+interface Wire {
+  /** The error type for a prompt no free model would answer. */
+  refusedType: string;
+  /** The gateway's SSE stream as the client's events. */
+  relay: (stream: ReadableStream<Uint8Array>, model: string) => AsyncGenerator<string>;
+  /** The gateway's JSON answer as the client's object. */
+  translate: (answer: Json, model: string) => Json;
+}
+
+/** The OpenAI wire: upstream errors, Chat Completions frames, the model field put back. */
+const OPENAI_WIRE: Wire = { refusedType: 'upstream_error', relay: openAIStreamWithModel, translate: openAIJsonWithModel };
+/** The Anthropic wire: API errors, the Messages event sequence, the answer translated back. */
+const ANTHROPIC_WIRE: Wire = { refusedType: 'api_error', relay: anthropicEventsFromOpenAI, translate: openAIToAnthropic };
+
+/**
+ * One prompt answered on either wire: read the body, serve it from the free models that meet it, and
+ * relay the gateway's answer — as SSE when the client asked to stream, as one translated JSON object
+ * otherwise. `makeBody` builds the Chat Completions body for the model being dialled; the OpenAI wire
+ * passes the client's body through, the Anthropic wire rewrites it first.
+ */
+async function answer(
+  req: IncomingMessage,
+  res: ServerResponse,
+  shape: 'openai' | 'anthropic',
+  wire: Wire,
+  makeBody: (body: Json, model: string) => Json,
+): Promise<void> {
   const body = await readJson(req);
-  if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const result = await serve(() => ({ ...body }), requirementsFor(body));
-  if (result === null) return sendError(res, 'openai', 502, 'upstream_error', 'every free model that meets this request refused it');
+  if (body === null) return sendError(res, shape, 400, 'invalid_request_error', 'the request body is not one JSON object');
+  const result = await serve((id) => makeBody(body, id), requirementsFor(body));
+  if (result === null) return sendError(res, shape, 502, wire.refusedType, 'every free model that meets this request refused it');
   const { model, upstream, failures } = result;
   const extra = failureHeaders(failures);
   if (body.stream === true) {
     const stream = upstream.body;
-    if (stream === null) return sendError(res, 'openai', 502, 'upstream_error', 'the gateway answered with no body');
+    if (stream === null) return sendError(res, shape, 502, wire.refusedType, 'the gateway answered with no body');
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...extra });
     try {
-      for await (const frame of openAIStreamWithModel(stream, model.id)) res.write(frame);
+      for await (const frame of wire.relay(stream, model.id)) res.write(frame);
     } finally {
       res.end();
     }
     return;
   }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, model.id), extra);
+  const reply: unknown = await upstream.json();
+  sendJson(res, 200, wire.translate(isRecord(reply) ? reply : {}, model.id), extra);
+}
+
+/** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that meets it. */
+async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  await answer(req, res, 'openai', OPENAI_WIRE, (body) => ({ ...body }));
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson(req);
-  if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const result = await serve((id) => anthropicToOpenAI(body, id), requirementsFor(body));
-  if (result === null) return sendError(res, 'anthropic', 502, 'api_error', 'every free model that meets this request refused it');
-  const { model, upstream, failures } = result;
-  const extra = failureHeaders(failures);
-  if (body.stream === true) {
-    const stream = upstream.body;
-    if (stream === null) return sendError(res, 'anthropic', 502, 'api_error', 'the gateway answered with no body');
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...extra });
-    try {
-      for await (const event of anthropicEventsFromOpenAI(stream, model.id)) res.write(event);
-    } finally {
-      res.end();
-    }
-    return;
-  }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, model.id), extra);
+  await answer(req, res, 'anthropic', ANTHROPIC_WIRE, (body, id) => anthropicToOpenAI(body, id));
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
