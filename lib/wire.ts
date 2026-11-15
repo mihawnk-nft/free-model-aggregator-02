@@ -129,10 +129,65 @@ export function stopReasonOf(finish: unknown): string {
 }
 
 /**
+ * One Anthropic assistant content array as an OpenAI assistant message: its text, and its tool_use
+ * blocks as tool_calls. A tool_use block without an id gets a deterministic one from its position
+ * among the tool_use blocks, because the gateway rejects an empty tool_call id and a made-up id
+ * would break the pairing with the tool_result that answers it.
+ */
+function assistantMessageOf(content: unknown[]): Json {
+  const toolCalls: Json[] = [];
+  let seen = 0;
+  for (const block of content) {
+    if (!isRecord(block) || block.type !== 'tool_use') continue;
+    toolCalls.push({
+      id: typeof block.id === 'string' && block.id !== '' ? block.id : `toolu_${seen}`,
+      type: 'function',
+      function: {
+        name: typeof block.name === 'string' ? block.name : '',
+        arguments: JSON.stringify(isRecord(block.input) ? block.input : {}),
+      },
+    });
+    seen += 1;
+  }
+  const text = textOf(content);
+  return {
+    role: 'assistant',
+    content: text !== '' ? text : null,
+    ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+  };
+}
+
+/**
+ * One Anthropic user content array as OpenAI messages: its tool_result blocks first, as tool
+ * messages in order, then its text and image parts as one user message when there are any. The tool
+ * messages come first because the gateway pairs each with the assistant turn that called it, and the
+ * parts follow as the user's new turn.
+ */
+function userMessagesOf(content: unknown[]): Json[] {
+  const out: Json[] = [];
+  const parts: Json[] = [];
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    if (block.type === 'tool_result') {
+      out.push({
+        role: 'tool',
+        tool_call_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
+        content: toolResultText(block.content),
+      });
+      continue;
+    }
+    const part = partOf(block);
+    if (part !== null) parts.push(part);
+  }
+  if (parts.length > 0) out.push({ role: 'user', content: parts });
+  return out;
+}
+
+/**
  * An Anthropic Messages request as an OpenAI Chat Completions request that names `model`: the system
- * prompt becomes a system message, image blocks become image_url data URLs, tool_use blocks become
- * tool_calls, tool_result blocks become tool messages, tools and tool_choice are rewritten, and the
- * output cap, temperature, top_p, stop sequences and streaming pass through.
+ * prompt becomes a system message, each turn becomes its assistant or user messages, tools and
+ * tool_choice are rewritten, and the output cap, temperature, top_p, stop sequences and streaming
+ * pass through.
  */
 export function anthropicToOpenAI(body: Json, model: string): Json {
   const messages: Json[] = [];
@@ -141,49 +196,14 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   const source = Array.isArray(body.messages) ? body.messages : [];
   for (const raw of source) {
     if (!isRecord(raw)) continue;
-    const assistant = raw.role === 'assistant';
     const content = raw.content;
     if (typeof content === 'string') {
-      messages.push({ role: assistant ? 'assistant' : 'user', content });
+      messages.push({ role: raw.role === 'assistant' ? 'assistant' : 'user', content });
       continue;
     }
     if (!Array.isArray(content)) continue;
-    if (assistant) {
-      const toolCalls: Json[] = [];
-      for (const block of content) {
-        if (!isRecord(block) || block.type !== 'tool_use') continue;
-        toolCalls.push({
-          id: typeof block.id === 'string' ? block.id : '',
-          type: 'function',
-          function: {
-            name: typeof block.name === 'string' ? block.name : '',
-            arguments: JSON.stringify(isRecord(block.input) ? block.input : {}),
-          },
-        });
-      }
-      const text = textOf(content);
-      messages.push({
-        role: 'assistant',
-        content: text !== '' ? text : null,
-        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-      });
-      continue;
-    }
-    const parts: Json[] = [];
-    for (const block of content) {
-      if (!isRecord(block)) continue;
-      if (block.type === 'tool_result') {
-        messages.push({
-          role: 'tool',
-          tool_call_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
-          content: toolResultText(block.content),
-        });
-        continue;
-      }
-      const part = partOf(block);
-      if (part !== null) parts.push(part);
-    }
-    if (parts.length > 0) messages.push({ role: 'user', content: parts });
+    if (raw.role === 'assistant') messages.push(assistantMessageOf(content));
+    else messages.push(...userMessagesOf(content));
   }
 
   const out: Json = { model, messages };
