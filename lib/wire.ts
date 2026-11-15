@@ -20,6 +20,16 @@
 //   every streamed chunk. They never make a model up: the id came from the brief and went to the
 //   gateway in the request's `model`.
 //
+// THE FRAMES
+//   Both stream relays read the same upstream: a reader, a decoder and a buffer split on the blank
+//   line that ends each SSE frame. That framing lives in one place, `framesFromStream`, so the two
+//   relays cannot drift apart on what a frame is. A frame cut across reads is held until its end
+//   arrives, and a body that ends without one is yielded as it is. Line endings follow the SSE
+//   grammar — CRLF, LF or a lone CR — and a carriage return at the end of a read is left alone until
+//   the next read shows whether it opens a CRLF split across two reads; the final flush normalises
+//   it. A literal carriage return cannot appear inside a JSON string (JSON writes it escaped), so
+//   normalising it never rewrites a payload.
+//
 // Everything here is a pure function of its arguments, except the stream relays: no clock and no
 // randomness, so the same body and the same gateway answer give the same bytes on a replay. The two
 // model listings use fixed timestamps for the same reason: a `created` that moved between runs would be
@@ -257,6 +267,45 @@ export function sseEvent(event: string | null, data: unknown): string {
 }
 
 /**
+ * SSE line endings in `text`, normalised to LF. A carriage return at the very end of the text is left
+ * alone: it may be the first half of a CRLF split across two reads, and the next read decides it.
+ * One pass, so a lone CR directly before a CRLF (`\r\r\n`, a blank line written as CR then CRLF)
+ * becomes two line breaks rather than one. The lookahead is `(?!$)` and not `(?=.)`: `.` never
+ * matches a line terminator, so a `(?=.)` lookahead misses a `\r` that is followed by another `\r`.
+ */
+function normalizeLineEndings(text: string): string {
+  return text.replace(/\r\n|\r(?!$)/g, '\n');
+}
+
+/**
+ * The upstream's SSE body as frames: the blank line ends each frame, as the SSE grammar does. A frame
+ * cut across reads is held until its end arrives; a body that ends without one is yielded as it is.
+ * The reader is released when the stream ends or the consumer stops reading.
+ */
+export async function* framesFromStream(upstream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer = normalizeLineEndings(buffer + decoder.decode(value, { stream: true }));
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        yield buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        at = buffer.indexOf('\n\n');
+      }
+    }
+    buffer = (buffer + decoder.decode()).replace(/\r\n?/g, '\n');
+    if (buffer.trim() !== '') yield buffer;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
  * One SSE frame with every data payload's `model` set to `model`, and its blank line kept: comments,
  * `event:` lines and payloads that are not JSON objects pass through untouched. Chat Completions names
  * the model on its chunks; the client sees the id the entry dialled, never the provider's spelling.
@@ -280,31 +329,10 @@ function frameWithModel(frame: string, model: string): string {
 
 /**
  * A Chat Completions SSE stream as it came, frame by frame, every data payload's `model` the id the
- * entry dialled. Frames are split on the blank line that ends them, as the SSE grammar does; a frame cut
- * across reads is held until its end arrives, and a body that ends without one is relayed as it is.
+ * entry dialled.
  */
 export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
-        at = buffer.indexOf('\n\n');
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
-  } finally {
-    reader.releaseLock();
-  }
+  for await (const frame of framesFromStream(upstream)) yield frameWithModel(frame, model);
 }
 
 /**
@@ -313,9 +341,6 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
  * usage, then message_stop. `model` is the id the entry dialled, named back to the client.
  */
 export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
   let started = false;
   let finished = false;
   /** The stop reason a finish_reason named, held until the stream's usage chunk has arrived. */
@@ -439,23 +464,8 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     return out;
   };
 
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        for (const event of eventsOfFrame(frame)) yield event;
-        at = buffer.indexOf('\n\n');
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') for (const event of eventsOfFrame(buffer)) yield event;
-  } finally {
-    reader.releaseLock();
+  for await (const frame of framesFromStream(upstream)) {
+    for (const event of eventsOfFrame(frame)) yield event;
   }
   if (!finished) {
     for (const event of startEvents()) yield event;
